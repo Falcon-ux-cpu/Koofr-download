@@ -18,7 +18,6 @@ CONFIG = {
     "sender_filter": os.getenv("SENDER_FILTER", os.getenv("TARGET_NOTIFICATION")),
 }
 
-# Базовый URL для Koofr WebDAV API
 WEBDAV_BASE = "https://app.koofr.net/dav/Koofr"
 
 def clean_name(name):
@@ -33,21 +32,25 @@ def create_koofr_folder(folder_name):
     clean_folder = clean_name(folder_name)
     url = f"{WEBDAV_BASE}/{clean_folder}"
     auth = (CONFIG["koofr_user"], CONFIG["koofr_pass"])
-    
-    # MKCOL создает папку по протоколу WebDAV
     requests.request("MKCOL", url, auth=auth)
     return clean_folder
 
 def get_file_size_mb(path):
     url = f"{WEBDAV_BASE}/{path}"
     auth = (CONFIG["koofr_user"], CONFIG["koofr_pass"])
-    
-    # HEAD-запрос для получения размера файла без его скачивания
     res = requests.head(url, auth=auth)
     if res.status_code == 200:
         size_bytes = int(res.headers.get('Content-Length', 0))
         return round(size_bytes / (1024 * 1024), 2)
     return 0
+
+def mark_email_as_seen(uid):
+    """Отдельное подключение для безопасной пометки письма как прочитанного"""
+    try:
+        with MailBox(CONFIG["imap_server"]).login(CONFIG["email_user"], CONFIG["email_pass"]) as mailbox:
+            mailbox.flag(uid, ['SEEN'], True)
+    except Exception as e:
+        print(f"Не удалось пометить письмо {uid} прочитанным: {e}")
 
 def send_final_notification(filename, size_mb):
     body = (
@@ -67,23 +70,19 @@ def send_final_notification(filename, size_mb):
         print(f"Ошибка отправки уведомления: {e}")
 
 def parse_content(text):
-    # Очистка текста от HTML и лишних переносов
     text = re.sub('<[^<]+?>', '', text).replace('\r', '').strip()
     
-    # Поиск URL
     url_match = re.search(r'https?://[^\s]+', text)
     if not url_match:
         return None, None, None, None
     url = url_match.group(0).strip()
     
-    # Поиск Login: и Pass:
     login_match = re.search(r'Login:\s*(\S+)', text)
     pass_match = re.search(r'Pass:\s*(\S+)', text)
     
     login = login_match.group(1) if login_match else None
     password = pass_match.group(1) if pass_match else None
 
-    # Определение пути (сериал или фильм)
     series_match = re.search(r'Смотреть (.+?) Сезон (\d+) - Эпизод (\d+)', text)
     if series_match:
         title, s_num, e_num = series_match.groups()
@@ -96,7 +95,6 @@ def parse_content(text):
         title = clean_name(movie_match.group(1).strip())
         return url, f"{title}.mp4", login, password
 
-    # Обработка формата "ссылка название"
     after_url = text[url_match.end():].strip()
     after_url_clean = re.sub(r'(Login|Pass):\s*\S+', '', after_url, flags=re.IGNORECASE).strip()
     
@@ -104,7 +102,6 @@ def parse_content(text):
         first_line = after_url_clean.split('\n')[0].strip()
         return url, clean_name(first_line), login, password
     
-    # Запасной вариант: имя из самого URL
     raw_name = url.split('/')[-1]
     return url, clean_name(raw_name), login, password
 
@@ -116,13 +113,12 @@ def upload_via_koofr(url, koofr_path, login=None, password=None):
     try:
         print(f"Загрузка начата на Koofr (Auth: {'Да' if login else 'Нет'})...")
         
-        # Скачиваем файл потоком и загружаем по WebDAV на Koofr
-        with requests.get(url, auth=src_auth, stream=True, timeout=60) as src_res:
+        with requests.get(url, auth=src_auth, stream=True, timeout=120) as src_res:
             if src_res.status_code != 200:
                 print(f"Ошибка скачивания источника: HTTP {src_res.status_code}")
                 return False
                 
-            put_res = requests.put(target_url, auth=auth, data=src_res.iter_content(chunk_size=8192))
+            put_res = requests.put(target_url, auth=auth, data=src_res.iter_content(chunk_size=65536))
             
             if put_res.status_code in [200, 201, 204]:
                 print(f"Файл {koofr_path} успешно загружен на Koofr.")
@@ -138,6 +134,9 @@ def upload_via_koofr(url, koofr_path, login=None, password=None):
 def main():
     print(f"--- Старт сессии: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
     
+    tasks = []
+    
+    # Шаг 1: Быстро собираем все непрочитанные письма и сразу закрываем IMAP
     try:
         with MailBox(CONFIG["imap_server"]).login(CONFIG["email_user"], CONFIG["email_pass"]) as mailbox:
             messages = list(mailbox.fetch(AND(from_=CONFIG["sender_filter"], seen=False)))
@@ -151,23 +150,35 @@ def main():
             for msg in messages:
                 content = msg.text or msg.html or ""
                 f_url, f_path, f_login, f_pass = parse_content(content)
-                
                 if f_url and f_path:
-                    print(f"Обработка: {f_path}")
-                    success = upload_via_koofr(f_url, f_path, f_login, f_pass)
-                    
-                    if success:
-                        size = get_file_size_mb(f_path)
-                        send_final_notification(f_path, size)
-                    else:
-                        print(f"Не удалось загрузить файл из письма {msg.uid}")
-                
-                mailbox.flag(msg.uid, ['SEEN'], True)
-                
+                    tasks.append({
+                        "uid": msg.uid,
+                        "url": f_url,
+                        "path": f_path,
+                        "login": f_login,
+                        "pass": f_pass
+                    })
     except Exception as e:
-        print(f"Ошибка выполнения: {e}")
-    
-    print(f"--- Сессия завершена ---")
+        print(f"Ошибка чтения почты: {e}")
+        return
+
+    # Шаг 2: Последовательно скачиваем файлы независимо от длинных таймаутов IMAP
+    for task in tasks:
+        print(f"\nОбработка: {task['path']}")
+        try:
+            success = upload_via_koofr(task["url"], task["path"], task["login"], task["pass"])
+            
+            if success:
+                size = get_file_size_mb(task["path"])
+                send_final_notification(task["path"], size)
+                # Помечаем прочитанным ТОЛЬКО после успешной загрузки
+                mark_email_as_seen(task["uid"])
+            else:
+                print(f"Не удалось загрузить файл из письма UID:{task['uid']}")
+        except Exception as err:
+            print(f"Сбой при обработке задания {task['path']}: {err}")
+
+    print(f"\n--- Сессия завершена ---")
 
 if __name__ == "__main__":
     main()
