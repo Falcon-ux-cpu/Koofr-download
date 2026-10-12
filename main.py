@@ -28,12 +28,15 @@ def clean_name(name):
         name = name[:match.start()]
     return name.strip() or "unnamed"
 
-def create_koofr_folder(folder_name):
-    clean_folder = clean_name(folder_name)
-    url = f"{WEBDAV_BASE}/{clean_folder}"
+def create_koofr_folder(folder_path):
+    parts = [clean_name(p) for p in folder_path.strip('/').split('/') if p]
+    current = ""
     auth = (CONFIG["koofr_user"], CONFIG["koofr_pass"])
-    requests.request("MKCOL", url, auth=auth)
-    return clean_folder
+    for part in parts:
+        current = f"{current}/{part}" if current else part
+        url = f"{WEBDAV_BASE}/{current}"
+        requests.request("MKCOL", url, auth=auth)
+    return current
 
 def get_file_size_mb(path):
     url = f"{WEBDAV_BASE}/{path}"
@@ -83,27 +86,68 @@ def parse_content(text):
     login = login_match.group(1) if login_match else None
     password = pass_match.group(1) if pass_match else None
 
+    # Оригинальные имя и расширение из URL
+    url_clean = url.split('?')[0]
+    orig_basename = url_clean.split('/')[-1]
+    orig_name, orig_ext = os.path.splitext(orig_basename)
+
+    # Поиск новых переменных с приоритетом
+    folder_match = re.search(r'^Папка:\s*(.+)$', text, re.MULTILINE)
+    path_match = re.search(r'^Путь:\s*(.+)$', text, re.MULTILINE)
+    name_match = re.search(r'^Название:\s*(.+)$', text, re.MULTILINE)
+    ext_match = re.search(r'^Расширение:\s*(.+)$', text, re.MULTILINE)
+
+    c_folder = folder_match.group(1).strip() if folder_match else None
+    c_path = path_match.group(1).strip() if path_match else None
+    c_name = name_match.group(1).strip() if name_match else None
+    c_ext = ext_match.group(1).strip() if ext_match else None
+
+    if c_ext and not c_ext.startswith('.'):
+        c_ext = f".{c_ext}"
+    final_ext = c_ext if c_ext else orig_ext
+
+    # Старая дефолтная логика (сериал, фильм или текст после ссылки)
+    default_folder = None
+    default_filename = None
+
     series_match = re.search(r'Смотреть (.+?) Сезон (\d+) - Эпизод (\d+)', text)
     if series_match:
         title, s_num, e_num = series_match.groups()
-        folder = create_koofr_folder(title.strip())
-        filename = f"{int(s_num):02d}-{int(e_num):02d}.mp4"
-        return url, f"{folder}/{filename}", login, password
+        default_folder = create_koofr_folder(title.strip())
+        default_filename = f"{int(s_num):02d}-{int(e_num):02d}{final_ext}"
+    else:
+        movie_match = re.search(r'Смотреть (.+?) (?:Дубляж|1080p|720p|\d+p)', text)
+        if movie_match:
+            title = clean_name(movie_match.group(1).strip())
+            default_filename = f"{title}{final_ext}"
+        else:
+            after_url = text[url_match.end():].strip()
+            after_url_clean = re.sub(r'(Login|Pass|Папка|Путь|Название|Расширение):\s*[^\n]+', '', after_url, flags=re.IGNORECASE).strip()
+            if after_url_clean:
+                first_line = after_url_clean.split('\n')[0].strip()
+                default_filename = f"{clean_name(first_line)}{final_ext}"
+            else:
+                default_filename = f"{clean_name(orig_name)}{final_ext}" if orig_name else f"unnamed{final_ext}"
 
-    movie_match = re.search(r'Смотреть (.+?) (?:Дубляж|1080p|720p|\d+p)', text)
-    if movie_match:
-        title = clean_name(movie_match.group(1).strip())
-        return url, f"{title}.mp4", login, password
+    # Итоговое имя файла
+    final_filename = f"{clean_name(c_name)}{final_ext}" if c_name else (default_filename if default_filename else f"unnamed{final_ext}")
 
-    after_url = text[url_match.end():].strip()
-    after_url_clean = re.sub(r'(Login|Pass):\s*\S+', '', after_url, flags=re.IGNORECASE).strip()
-    
-    if after_url_clean:
-        first_line = after_url_clean.split('\n')[0].strip()
-        return url, clean_name(first_line), login, password
-    
-    raw_name = url.split('/')[-1]
-    return url, clean_name(raw_name), login, password
+    # Обработка Пути и Папки
+    if c_path or c_folder:
+        path_parts = []
+        if c_path:
+            path_parts.extend([p for p in c_path.strip('/').split('/') if p])
+        if c_folder:
+            path_parts.append(clean_name(c_folder))
+        
+        full_folder_path = "/".join(path_parts)
+        created_folder = create_koofr_folder(full_folder_path)
+        return url, f"{created_folder}/{final_filename}", login, password
+    else:
+        if series_match and default_folder:
+            return url, f"{default_folder}/{final_filename}", login, password
+        else:
+            return url, final_filename, login, password
 
 def upload_via_koofr(url, koofr_path, login=None, password=None):
     target_url = f"{WEBDAV_BASE}/{koofr_path}"
